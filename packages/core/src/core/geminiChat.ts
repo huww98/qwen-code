@@ -47,7 +47,11 @@ export enum StreamEventType {
 
 export type StreamEvent =
   | { type: StreamEventType.CHUNK; value: GenerateContentResponse }
-  | { type: StreamEventType.RETRY; retryInfo?: RetryInfo };
+  | {
+      type: StreamEventType.RETRY;
+      retryInfo?: RetryInfo;
+      skipDelay?: () => void;
+    };
 
 /**
  * Options for retrying due to invalid content from the model.
@@ -83,6 +87,29 @@ const RATE_LIMIT_RETRY_OPTIONS = {
   maxRetries: 10,
   delayMs: 60000,
 };
+
+/**
+ * Creates a promise that resolves after the specified delay, but can be
+ * resolved early by calling the returned `skip` function.
+ */
+function skippableDelay(delayMs: number): {
+  promise: Promise<void>;
+  skip: () => void;
+} {
+  let resolveRef: () => void;
+  let timeoutId: ReturnType<typeof setTimeout>;
+  const promise = new Promise<void>((resolve) => {
+    resolveRef = resolve;
+    timeoutId = setTimeout(resolve, delayMs);
+  });
+  return {
+    promise,
+    skip: () => {
+      clearTimeout(timeoutId);
+      resolveRef();
+    },
+  };
+}
 
 /**
  * Returns true if the response is valid, false otherwise.
@@ -348,6 +375,7 @@ export class GeminiChat {
                 `Rate limit throttling detected (retry ${rateLimitRetryCount}/${maxRateLimitRetries}). ` +
                   `Waiting ${delayMs / 1000}s before retrying...`,
               );
+              const { promise: delayPromise, skip } = skippableDelay(delayMs);
               yield {
                 type: StreamEventType.RETRY,
                 retryInfo: {
@@ -356,10 +384,11 @@ export class GeminiChat {
                   maxRetries: maxRateLimitRetries,
                   delayMs,
                 },
+                skipDelay: skip,
               };
               // Don't count rate-limit retries against the content retry limit
               attempt--;
-              await new Promise((res) => setTimeout(res, delayMs));
+              await delayPromise;
               continue;
             }
 

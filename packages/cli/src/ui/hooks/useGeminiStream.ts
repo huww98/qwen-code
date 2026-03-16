@@ -175,6 +175,9 @@ export const useGeminiStream = (
   const isSubmittingQueryRef = useRef(false);
   const lastPromptRef = useRef<PartListUnion | null>(null);
   const lastPromptErroredRef = useRef(false);
+  // Holds the skip callback from the current rate-limit retry delay.
+  // When called, it resolves the delay early so the generator retries immediately.
+  const skipRetryDelayRef = useRef<(() => void) | null>(null);
   const [isResponding, setIsResponding] = useState<boolean>(false);
   const [thought, setThought] = useState<ThoughtSummary | null>(null);
   const [pendingHistoryItem, pendingHistoryItemRef, setPendingHistoryItem] =
@@ -1037,9 +1040,11 @@ export const useGeminiStream = (
             // Show retry info if available (rate-limit / throttling errors)
             if (event.retryInfo) {
               startRetryCountdown(event.retryInfo);
+              skipRetryDelayRef.current = event.skipDelay ?? null;
             } else {
               // The retry attempt is starting now, so any prior retry UI is stale.
               clearRetryCountdown();
+              skipRetryDelayRef.current = null;
             }
             break;
           case ServerGeminiEventType.HookSystemMessage:
@@ -1293,6 +1298,15 @@ export const useGeminiStream = (
    * when the user presses Ctrl+Y (bound to Command.RETRY_LAST in keyBindings.ts).
    */
   const retryLastPrompt = useCallback(async () => {
+    // During a rate-limit retry countdown, skip the delay so the generator
+    // retries immediately — no abort/re-submit needed.
+    if (skipRetryDelayRef.current) {
+      skipRetryDelayRef.current();
+      skipRetryDelayRef.current = null;
+      clearRetryCountdown();
+      return;
+    }
+
     if (
       streamingState === StreamingState.Responding ||
       streamingState === StreamingState.WaitingForConfirmation

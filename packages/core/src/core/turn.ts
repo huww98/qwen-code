@@ -70,6 +70,7 @@ export enum GeminiEventType {
 export type ServerGeminiRetryEvent = {
   type: GeminiEventType.Retry;
   retryInfo?: RetryInfo;
+  skipDelay?: () => void;
 };
 
 export interface StructuredError {
@@ -268,6 +269,7 @@ export class Turn {
           yield {
             type: GeminiEventType.Retry,
             retryInfo: streamEvent.retryInfo,
+            skipDelay: streamEvent.skipDelay,
           };
           continue; // Skip to the next event in the stream
         }
