@@ -65,6 +65,7 @@ import * as Diff from 'diff';
 import levenshtein from 'fast-levenshtein';
 import { getPlanModeSystemReminder } from './prompts.js';
 import { ShellToolInvocation } from '../tools/shell.js';
+import { IdeClient } from '../ide/ide-client.js';
 
 const TRUNCATION_PARAM_GUIDANCE =
   'Note: Your previous response was truncated due to max_tokens limit, ' +
@@ -592,7 +593,7 @@ export class CoreToolScheduler {
     args: object,
   ): AnyToolInvocation | Error {
     try {
-      return tool.build(args);
+      return tool.build(structuredClone(args));
     } catch (e) {
       if (e instanceof Error) {
         return e;
@@ -970,41 +971,6 @@ export class CoreToolScheduler {
               continue;
             }
 
-            // Allow IDE to resolve confirmation
-            if (
-              confirmationDetails.type === 'edit' &&
-              confirmationDetails.ideConfirmation
-            ) {
-              confirmationDetails.ideConfirmation.then((resolution) => {
-                // Guard: skip if the tool was already handled (e.g. by CLI
-                // confirmation).  Without this check, resolveDiffFromCli
-                // triggers this handler AND the CLI's onConfirm, causing a
-                // race where ProceedOnce overwrites ProceedAlways.
-                const still = this.toolCalls.find(
-                  (c) =>
-                    c.request.callId === reqInfo.callId &&
-                    c.status === 'awaiting_approval',
-                );
-                if (!still) return;
-
-                if (resolution.status === 'accepted') {
-                  this.handleConfirmationResponse(
-                    reqInfo.callId,
-                    confirmationDetails.onConfirm,
-                    ToolConfirmationOutcome.ProceedOnce,
-                    signal,
-                  );
-                } else {
-                  this.handleConfirmationResponse(
-                    reqInfo.callId,
-                    confirmationDetails.onConfirm,
-                    ToolConfirmationOutcome.Cancel,
-                    signal,
-                  );
-                }
-              });
-            }
-
             // Fire PermissionRequest hook before showing the permission dialog.
             const messageBus = this.config.getMessageBus() as
               | MessageBus
@@ -1069,6 +1035,13 @@ export class CoreToolScheduler {
                 continue;
               }
             }
+
+            // Allow IDE to resolve confirmation
+            this.openIdeDiffIfEnabled(
+              confirmationDetails,
+              reqInfo.callId,
+              signal,
+            );
 
             const originalOnConfirm = confirmationDetails.onConfirm;
             const wrappedConfirmationDetails: ToolCallConfirmationDetails = {
@@ -1223,6 +1196,69 @@ export class CoreToolScheduler {
       this.setStatusInternal(callId, 'scheduled');
     }
     await this.attemptExecutionOfScheduledCalls(signal);
+  }
+
+  /**
+   * Opens an IDE diff view for edit-type tools when IDE mode is active.
+   * The IDE resolution is handled asynchronously — if the user accepts or
+   * rejects from the IDE, it triggers handleConfirmationResponse.
+   */
+  private async openIdeDiffIfEnabled(
+    confirmationDetails: ToolCallConfirmationDetails,
+    callId: string,
+    signal: AbortSignal,
+  ) {
+    if (confirmationDetails.type !== 'edit' || !this.config.getIdeMode()) {
+      return;
+    }
+    const ideClient = await IdeClient.getInstance();
+    if (!ideClient.isDiffingEnabled()) return;
+
+    const toolCall = this.toolCalls.find((c) => c.request.callId === callId);
+    if (!toolCall) return;
+
+    // Use ModifyContext when available so the content sent to IDE is
+    // symmetric with what _applyInlineModify / createUpdatedParams expects.
+    let filePath: string;
+    let proposedContent: string;
+    if (toolCall.tool && isModifiableDeclarativeTool(toolCall.tool)) {
+      const modifyContext = toolCall.tool.getModifyContext(signal);
+      filePath = modifyContext.getFilePath(toolCall.request.args);
+      proposedContent = await modifyContext.getProposedContent(
+        toolCall.request.args,
+      );
+    } else {
+      filePath = confirmationDetails.filePath;
+      proposedContent = confirmationDetails.newContent;
+    }
+
+    const resolution = await ideClient.openDiff(filePath, proposedContent);
+
+    // Guard: skip if the tool was already handled (e.g. by CLI
+    // confirmation).  Without this check, resolveDiffFromCli
+    // triggers this handler AND the CLI's onConfirm, causing a
+    // race where ProceedOnce overwrites ProceedAlways.
+    const still = this.toolCalls.find(
+      (c) => c.request.callId === callId && c.status === 'awaiting_approval',
+    );
+    if (!still) return;
+
+    if (resolution.status === 'accepted') {
+      this.handleConfirmationResponse(
+        callId,
+        confirmationDetails.onConfirm,
+        ToolConfirmationOutcome.ProceedOnce,
+        signal,
+        resolution.content ? { newContent: resolution.content } : undefined,
+      );
+    } else {
+      this.handleConfirmationResponse(
+        callId,
+        confirmationDetails.onConfirm,
+        ToolConfirmationOutcome.Cancel,
+        signal,
+      );
+    }
   }
 
   /**

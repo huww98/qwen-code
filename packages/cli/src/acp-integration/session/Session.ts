@@ -13,7 +13,6 @@ import type {
 import type {
   Config,
   GeminiChat,
-  ToolCallConfirmationDetails,
   ToolResult,
   ChatRecord,
   AgentEventEmitter,
@@ -496,27 +495,6 @@ export class Session implements SessionContext {
     await this.sendUpdate(update);
   }
 
-  private async resolveIdeDiffForOutcome(
-    confirmationDetails: ToolCallConfirmationDetails,
-    outcome: ToolConfirmationOutcome,
-  ): Promise<void> {
-    if (
-      confirmationDetails.type !== 'edit' ||
-      !confirmationDetails.ideConfirmation
-    ) {
-      return;
-    }
-
-    const { IdeClient } = await import('@qwen-code/qwen-code-core');
-    const ideClient = await IdeClient.getInstance();
-    const cliOutcome =
-      outcome === ToolConfirmationOutcome.Cancel ? 'rejected' : 'accepted';
-    await ideClient.resolveDiffFromCli(
-      confirmationDetails.filePath,
-      cliOutcome as 'accepted' | 'rejected',
-    );
-  }
-
   private async runTool(
     abortSignal: AbortSignal,
     promptId: string,
@@ -731,10 +709,6 @@ export class Session implements SessionContext {
                   hookResult.updatedInput as typeof invocation.params;
               }
 
-              await this.resolveIdeDiffForOutcome(
-                confirmationDetails,
-                ToolConfirmationOutcome.ProceedOnce,
-              );
               await confirmationDetails.onConfirm(
                 ToolConfirmationOutcome.ProceedOnce,
               );
@@ -804,8 +778,6 @@ export class Session implements SessionContext {
               : z
                   .nativeEnum(ToolConfirmationOutcome)
                   .parse(output.outcome.optionId);
-
-          await this.resolveIdeDiffForOutcome(confirmationDetails, outcome);
 
           await confirmationDetails.onConfirm(outcome, {
             answers: output.answers,
